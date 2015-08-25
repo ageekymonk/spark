@@ -44,7 +44,7 @@ class KNNJoin1(object):
 
     def setup(self):
         self.pivots = self.compute_pivots()
-        print(self.pivots)
+        # print(self.pivots)
         pivots = self.pivots
 
         def find_nearest_pivot(point):
@@ -166,9 +166,17 @@ class KNNJoin1(object):
         for i in range(self.num_pivots):
             lb_r = []
             for j in range(self.num_pivots):
-                lb_r.append(math.sqrt(self.pivots[i].squared_distance(self.pivots[j])) -
-                          r_dict[j]['max_distance'] - ub[j])
+                dist = math.sqrt(self.pivots[i].squared_distance(self.pivots[j])) - r_dict[j]['max_distance'] - ub[j]
+                if (dist < 0 ):
+                    dist = 0
+                if dist < r_dict[i]['max_distance'] and dist < s_dict[i]['max_distance']+1:
+                    lb_r.append(dist)
+                else:
+                    lb_r.append(s_dict[i]['max_distance']+1)
+
             lb.append(lb_r)
+            print(lb)
+            exit(0)
         return lb
 
     def compute_knn(self, r_part, s_part):
@@ -186,7 +194,7 @@ class KNNJoin1(object):
             for r_elem in item[1][0]:
                 theta = ub[item[0]]
                 pq = PriorityQueue()
-                print("Size of s_elem is {0}".format(len(list(item[1][1]))))
+                # print("Size of s_elem is {0}".format(len(list(item[1][1]))))
 
                 for i in range(num_pivots):
                     distToHP = (pivots[i].squared_distance(r_elem[0]) - pivots[item[0]].squared_distance(r_elem[0])) / (
@@ -217,7 +225,7 @@ class KNNJoin1(object):
                     while not pq.empty():
                         v = pq.get()
                         res_dict[r_elem].append(v)
-                        print("Neighbour: {0} {1}".format(v[0],v[1]))
+                        # print("Neighbour: {0} {1}".format(v[0],v[1]))
             print("Saved is {0}".format(saved))
             return res_dict
 
@@ -236,9 +244,10 @@ if __name__ == "__main__":
     """
     if len(sys.argv) > 1:
         iris_data_str = sc.textFile(sys.argv[1])
-        iris_data = iris_data_str.map(lambda (x): (Vectors.dense(x.split(',')[0:-1]), x.split(',')[-1]))
+        iris_data = iris_data_str.map(lambda (x): (Vectors.dense(x.split(',')[0:10]), x.split(',')[-1]))
+
         # model = KNNJoin(3, iris_data, iris_data, 3)
-        KNNJoin1(3, iris_data, iris_data, 5, 1)
+        KNNJoin1(3, iris_data, iris_data, 200, 1)
 
         # print(iris_data.mapPartitions(lambda(x): [len(list(x))]).collect())
         # for rdd in iris_data.randomSplit([0.3, 0.3, 0.4]):
