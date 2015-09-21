@@ -105,8 +105,8 @@ class KNearestNeighbourModel(override val uid: String,
 
   def generateSummaryTable(pFeatures: RDD[(Int, (Vector, Double))], pTrain: RDD[(Int, (LabeledPoint, Double))]) = {
 
-    val featureSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
-    val trainSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
+    featureSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
+    trainSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
 
     pFeatures.glom().map( v => (v.maxBy(_._2._2), v.minBy(_._2._2), v.length)).collect().foreach( (elem) =>
       featureSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2, "count" -> elem._3)
@@ -116,8 +116,7 @@ class KNearestNeighbourModel(override val uid: String,
       trainSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2, "topn" -> elem._3.toList)
     )
 
-    //    println(trainSummary)
-
+    println(featureSummary)
   }
 
   def getUpperBound() = {
@@ -138,7 +137,7 @@ class KNearestNeighbourModel(override val uid: String,
 
     // pfeatures is the voronoi partitioned RDD. Number of partition = number of pivots
     // Each partition is sorted by Distance from pivot
-    // Each element is tuple of (pivot index, (vector, distance to pivot))
+    // Each element is tuple of (pivot_index, (vector, distance_to_pivot))
     val pfeatures = features.map( (fvector) =>
       (pivots.zipWithIndex.map((v) =>
         (v._2, (fvector, Vectors.sqdist(v._1, fvector)))).minBy((v) => v._2._2))
@@ -146,7 +145,7 @@ class KNearestNeighbourModel(override val uid: String,
 
     // pTrain is the voronoi partitioned RDD. Number of partition = number of pivots
     // Each partition is sorted by Distance from pivot
-    // Each element is tuple of (pivot index, (labeled point, distance to pivot))
+    // Each element is tuple of (pivot_index, (labeled_point, distance_to_pivot))
     val pTrain = trainData.map( (lpoint) => (pivots.zipWithIndex.map((v) =>
       (v._2, (lpoint, Vectors.sqdist(v._1, lpoint.features)))).minBy((v) => v._2._2))
     ).partitionBy(new spark.HashPartitioner(pivots.length)).mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
@@ -155,75 +154,97 @@ class KNearestNeighbourModel(override val uid: String,
 
     generateSummaryTable(pfeatures, pTrain)
 
-    println("Number of partitions in pfeatures = " + pfeatures.partitions.size.toString)
-    println("Number of partitions in pTrain = " + pTrain.partitions.size.toString)
+    println("ERROR: Number of partitions in pfeatures = " + pfeatures.partitions.size.toString)
+    println("ERROR: Number of partitions in pTrain = " + pTrain.partitions.size.toString)
 
     // Join  => (pivot index ((vector, distance to pivot), (labeled point, distance to pivot) )  )
     // map  => (vector, (labeled point, pivot index))
     // groupByKey => (vector, [(labeled point, pivot index)])
     // map => (vector, (idx, [N Neighbour labeled point, distance ])
 
-    val pFeatureWithLN = pfeatures.join(pTrain).map( (v) =>
-      (v._2._1._1, (v._2._2._1, Vectors.sqdist(v._2._1._1, v._2._2._1.features), v._1))
-    ).groupByKey().flatMap( v => List((v._1, v._2.toArray.sortBy(_._2).take(numNeighbours).toList)))
+//    val pFeatureWithLN = pfeatures.join(pTrain).map( (v) =>
+//      (v._2._1._1, (v._2._2._1, Vectors.sqdist(v._2._1._1, v._2._2._1.features), v._1))
+//    ).groupByKey().flatMap( v => List((v._1, v._2.toArray.sortBy(_._2).take(numNeighbours).toList)))
 
-    println("Number of partitions in pFeatureWithLN = " + pFeatureWithLN.partitions.size.toString)
+    // pFeatureWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id))
+    val pFeatureWithLN = pTrain.glom().mapPartitionsWithIndex( (idx, iter) => {
+      val elemList = iter.next()
+      List((elemList(0)._1, elemList)).toIterator
+    }
+    ).join(pfeatures).map( (v) => {
+      val elemList = v._2._1
+      val rElem = v._2._2
+      (rElem._1, elemList.map((elem) => (elem._2._1, Vectors.sqdist(elem._2._1.features, rElem._1), elem._1)).sortBy(_._2).take(numNeighbours).toList)
+    }
+    )
+    println("ERROR: Number of partitions in pFeatureWithLN = " + pFeatureWithLN.partitions.size.toString)
 
     // (featureVector, Neighbours)
+    // pFWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check)
     val pFWithLNAndRN = pFeatureWithLN.map( (v) =>
       (v._1, v._2, pivots.zipWithIndex.flatMap({
         case (p, idx) =>
           if ((p != v._1) && (p != pivots(v._2(0)._3))) {
             val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._2(0)._3))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._2(0)._3))))
-            if (dist >= math.sqrt(v._2.last._2)) {
+            if ((dist >= math.sqrt(v._2.last._2)) ||
+              (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist)) {
               None
             }
             else {
-              List(idx)
+              List((math.sqrt(v._2.last._2) - dist, idx))
             }
           }
           else {
             None
           }
       }
-      ).toList, v._2(0)._3
+      ).sortBy(_._1).reverse.map(_._2).toList, v._2(0)._3
     ))
 
-    println("KNN Found within same partition = " + pFWithLNAndRN.filter((v) => v._3.length == 0).count())
-//    println("KNN Found within 1 partition = " + pFWithLNAndRN.filter((v) => v._3.length == 1).count())
-//    println("KNN Found within 2 partition = " + pFWithLNAndRN.filter((v) => v._3.length == 2).count())
-//    println("KNN Found within 3 partition = " + pFWithLNAndRN.filter((v) => v._3.length == 3).count())
-//    println("KNN Found within 4 partition = " + pFWithLNAndRN.filter((v) => v._3.length == 4).count())
-//    println("KNN Found within 5 partition = " + pFWithLNAndRN.filter((v) => v._3.length == 5).count())
-//    println("KNN Found within >5 partition = " + pFWithLNAndRN.filter((v) => v._3.length > 5).count())
+    println("ERROR: KNN Found within same partition = " + pFWithLNAndRN.filter((v) => v._3.length == 0).count())
 
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
 
     while(pf.count() > 0)
     {
       val pFilteredR = pf
-      println("Number of partitions in pFilteredR = " + pFilteredR.partitions.size.toString)
-
       // Move R data to another partition
       val pFilteredRWithPart = pFilteredR.map(v => (v._3.head, (v._1, v._2, v._3.tail, v._4)))
-      println("Number of partitions in pFilteredRWithPart = " + pFilteredRWithPart.partitions.size.toString)
 
       // Find N Neighbours greater than last
-      val newRWithLN = pFilteredRWithPart.join(pTrain).flatMap( (v) => {
-        val dist = Vectors.sqdist(v._2._1._1, v._2._2._1.features)
-        if (dist > v._2._1._2.last._2) {
-          List((v._2._1._1,(v._2._1._2.last, v._2._1._2, v._2._1._3, v._2._1._4)))
+//      val newRWithLN = pFilteredRWithPart.join(pTrain).flatMap( (v) => {
+//        val dist = Vectors.sqdist(v._2._1._1, v._2._2._1.features)
+//        if (dist > v._2._1._2.last._2) {
+//          List((v._2._1._1,(v._2._1._2.last, v._2._1._2, v._2._1._3, v._2._1._4)))
+//        }
+//        else
+//        {
+//          // vector, nn, nnlist, nextpart
+//          List((v._2._1._1,((v._2._2._1, dist, v._1), v._2._1._2, v._2._1._3, v._2._1._4)))
+//        }
+//      }).groupByKey().flatMap( v => {
+//        val nn = v._2.head._2 ::: v._2.flatMap( (pts) => List(pts._1)).toList
+//        nn.sortBy(_._2).take(numNeighbours).toList
+//        List((v._1, nn, v._2.head._3, v._2.head._4))
+//      })
+
+      val newRWithLN = pTrain.glom().mapPartitionsWithIndex( (idx, iter) => {
+        val elemList = iter.next()
+        List((elemList(0)._1, elemList)).toIterator
+      }
+      ).join(pFilteredRWithPart).map( (v) => {
+        val elemList = v._2._1
+        val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
+        (rElem, rElemNbrs :::  elemList.flatMap((elem) => {
+          val dist = Vectors.sqdist(elem._2._1.features, rElem)
+          if (dist < rElemNbrs.last._2)
+            List((elem._2._1, dist, elem._1))
+          else
+            None
         }
-        else
-        {
-          // vector, nn, nnlist, nextpart
-          List((v._2._1._1,((v._2._2._1, dist, v._1), v._2._1._2, v._2._1._3, v._2._1._4)))
-        }
-      }).groupByKey().flatMap( v => {
-        val nn = v._2.head._2 ::: v._2.flatMap( (pts) => List(pts._1)).toList
-        nn.sortBy(_._2).take(numNeighbours).toList
-        List((v._1, nn, v._2.head._3, v._2.head._4))
+        ).sortBy(_._2).take(numNeighbours).toList, rElemPart, idx)
       })
+
 
       // (featureVector, Neighbours)
       val newRWithLNAndRN = newRWithLN.map( (v) =>
@@ -232,25 +253,20 @@ class KNearestNeighbourModel(override val uid: String,
             val p = pivots(idx)
             if (p != v._1) {
               val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._4))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._4))))
-              if (dist >= math.sqrt(v._2.last._2)) {
+              if ((dist >= math.sqrt(v._2.last._2)) ||
+                (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist)) {
                 None
               }
               else {
-                List(idx)
+                List((math.sqrt(v._2.last._2) - dist, idx))
               }
             }
             else {
               None
             }
-        }).toList, v._4)
+        }).sortBy(_._1).reverse.map(_._2).toList, v._4)
       )
-      println("KNN Found within same partition = " + newRWithLNAndRN.filter((v) => v._3.length == 0).count())
-//      println("KNN Found within 1 partition = " + newRWithLNAndRN.filter((v) => v._3.length == 1).count())
-//      println("KNN Found within 2 partition = " + newRWithLNAndRN.filter((v) => v._3.length == 2).count())
-//      println("KNN Found within 3 partition = " + newRWithLNAndRN.filter((v) => v._3.length == 3).count())
-//      println("KNN Found within 4 partition = " + newRWithLNAndRN.filter((v) => v._3.length == 4).count())
-//      println("KNN Found within 5 partition = " + newRWithLNAndRN.filter((v) => v._3.length == 5).count())
-//      println("KNN Found within >5 partition = " + newRWithLNAndRN.filter((v) => v._3.length > 5).count())
+      println("ERROR: KNN Found within same partition = " + newRWithLNAndRN.filter((v) => v._3.length == 0).count())
 
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
     }
@@ -262,7 +278,7 @@ class KNearestNeighbourModel(override val uid: String,
   protected def randomPivotSelect(rData: RDD[Vector]) = {
 
     val pivot_distance = rData.mapPartitionsWithIndex { (idx, iter) =>
-      val total_dist = iter.toSeq.combinations(2).toList.foldLeft(0.0) { (dist, vecs) =>
+      val total_dist = iter.toSeq.combinations(2).foldLeft(0.0) { (dist, vecs) =>
         dist + Vectors.sqdist(vecs(0), vecs(1))
       }
       List((idx, total_dist)).toIterator
@@ -278,9 +294,10 @@ class KNearestNeighbourModel(override val uid: String,
 
   def computePivots(RData: RDD[Vector], strategy: String = "random"): Array[Vector] = {
 
+    println("ERROR: Starting to compute pivots")
     val pRData = RData.sample(false, 1.0, 101).zipWithIndex().map( v => (v._2, v._1))
       .partitionBy(new spark.HashPartitioner((featureDataLen/numPivots).asInstanceOf[Int])).map(_._2)
-
+    println("ERROR: Data is Partitioned")
     strategy match  {
       case "random" => randomPivotSelect(pRData)
 //      case "greedy" => kmeansPivotSelect(pRData)
