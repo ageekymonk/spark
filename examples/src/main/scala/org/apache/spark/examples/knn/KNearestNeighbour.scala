@@ -30,9 +30,20 @@ import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.{PartitionPruningRDD, RDD}
 import org.apache.spark.sql.DataFrame
 import scala.collection.mutable
-import org.apache.spark.HashPartitioner
+import org.apache.spark.{Partitioner, HashPartitioner}
 
+class ExactPartitioner[V](partitions: Int)
+  extends Partitioner {
 
+  def getPartition(key: Any): Int = {
+    val k = key.asInstanceOf[Int]
+    return k % partitions
+  }
+
+  override def numPartitions: Int = {
+    return partitions
+  }
+}
 
 /**
  * Naive Bayes Classifiers.
@@ -166,7 +177,7 @@ class KNearestNeighbourModel(override val uid: String,
 //      (v._2._1._1, (v._2._2._1, Vectors.sqdist(v._2._1._1, v._2._2._1.features), v._1))
 //    ).groupByKey().flatMap( v => List((v._1, v._2.toArray.sortBy(_._2).take(numNeighbours).toList)))
 
-    // pFeatureWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id))
+    // pFeatureWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
     val pFeatureWithLN = pTrain.glom().mapPartitionsWithIndex( (idx, iter) => {
       val elemList = iter.next()
       List((elemList(0)._1, elemList)).toIterator
@@ -174,13 +185,12 @@ class KNearestNeighbourModel(override val uid: String,
     ).join(pfeatures).map( (v) => {
       val elemList = v._2._1
       val rElem = v._2._2
-      (rElem._1, elemList.map((elem) => (elem._2._1, Vectors.sqdist(elem._2._1.features, rElem._1), elem._1)).sortBy(_._2).take(numNeighbours).toList)
+      (rElem._1, elemList.map((elem) => (elem._2._1, Vectors.sqdist(elem._2._1.features, rElem._1), elem._1)).sortBy(_._2).take(numNeighbours).toList, v._1)
     }
     )
     println("ERROR: Number of partitions in pFeatureWithLN = " + pFeatureWithLN.partitions.size.toString)
 
-    // (featureVector, Neighbours)
-    // pFWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check)
+    // pFWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check), feature_vector_partition_id)
     val pFWithLNAndRN = pFeatureWithLN.map( (v) =>
       (v._1, v._2, pivots.zipWithIndex.flatMap({
         case (p, idx) =>
@@ -198,36 +208,21 @@ class KNearestNeighbourModel(override val uid: String,
             None
           }
       }
-      ).sortBy(_._1).reverse.map(_._2).toList, v._2(0)._3
+      ).sortBy(_._1).reverse.map(_._2).toList, v._3
     ))
 
     println("ERROR: KNN Found within same partition = " + pFWithLNAndRN.filter((v) => v._3.length == 0).count())
 
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
+    var pfCount = pf.count()
 
-    while(pf.count() > 0)
+    while(pfCount > 500)
     {
       val pFilteredR = pf
       // Move R data to another partition
-      val pFilteredRWithPart = pFilteredR.map(v => (v._3.head, (v._1, v._2, v._3.tail, v._4)))
+      val pFilteredRWithPart = pFilteredR.map(v => (v._3.head, (v._1, v._2, v._3.tail, v._4))).partitionBy(new spark.HashPartitioner(numPivots))
 
-      // Find N Neighbours greater than last
-//      val newRWithLN = pFilteredRWithPart.join(pTrain).flatMap( (v) => {
-//        val dist = Vectors.sqdist(v._2._1._1, v._2._2._1.features)
-//        if (dist > v._2._1._2.last._2) {
-//          List((v._2._1._1,(v._2._1._2.last, v._2._1._2, v._2._1._3, v._2._1._4)))
-//        }
-//        else
-//        {
-//          // vector, nn, nnlist, nextpart
-//          List((v._2._1._1,((v._2._2._1, dist, v._1), v._2._1._2, v._2._1._3, v._2._1._4)))
-//        }
-//      }).groupByKey().flatMap( v => {
-//        val nn = v._2.head._2 ::: v._2.flatMap( (pts) => List(pts._1)).toList
-//        nn.sortBy(_._2).take(numNeighbours).toList
-//        List((v._1, nn, v._2.head._3, v._2.head._4))
-//      })
-
+      // newRWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
       val newRWithLN = pTrain.glom().mapPartitionsWithIndex( (idx, iter) => {
         val elemList = iter.next()
         List((elemList(0)._1, elemList)).toIterator
@@ -235,18 +230,17 @@ class KNearestNeighbourModel(override val uid: String,
       ).join(pFilteredRWithPart).map( (v) => {
         val elemList = v._2._1
         val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
-        (rElem, rElemNbrs :::  elemList.flatMap((elem) => {
+        val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
           val dist = Vectors.sqdist(elem._2._1.features, rElem)
           if (dist < rElemNbrs.last._2)
             List((elem._2._1, dist, elem._1))
           else
             None
-        }
-        ).sortBy(_._2).take(numNeighbours).toList, rElemPart, idx)
+        }).toList
+        (rElem, rElemNbrsUpdated.sortBy(_._2).take(numNeighbours), rElemPart, idx)
       })
 
-
-      // (featureVector, Neighbours)
+      // newRWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check), feature_vector_partition_id)
       val newRWithLNAndRN = newRWithLN.map( (v) =>
         (v._1, v._2, v._3.flatMap({
           case (idx) =>
@@ -264,12 +258,55 @@ class KNearestNeighbourModel(override val uid: String,
             else {
               None
             }
-        }).sortBy(_._1).reverse.map(_._2).toList, v._4)
+        }).sortBy(_._1).reverse.map(_._2), v._4)
       )
-      println("ERROR: KNN Found within same partition = " + newRWithLNAndRN.filter((v) => v._3.length == 0).count())
 
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
+      pfCount = pf.count()
+      println("ERROR: KNN Yet to be searched for = " + pfCount)
+
+      println("Total elems when replicated = " + pf.map((v) => v._3.size).reduce((tot, add) => tot + add))
     }
+
+    val pFilteredR = pf
+    // Replicated part
+    val pReplicatedRWithPart = pFilteredR.flatMap(v =>
+      v._3.map( (elem) => (elem, (v._1, v._2, None, v._4)))
+    ).partitionBy(new spark.HashPartitioner(numPivots))
+
+    // newRWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
+    val newRWithLN = pTrain.glom().mapPartitionsWithIndex( (idx, iter) => {
+      val elemList = iter.next()
+      List((elemList(0)._1, elemList)).toIterator
+    }
+    ).join(pReplicatedRWithPart).map( (v) => {
+      val elemList = v._2._1
+      val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
+      val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
+        val dist = Vectors.sqdist(elem._2._1.features, rElem)
+        if (dist < rElemNbrs.last._2)
+          List((elem._2._1, dist, elem._1))
+        else
+          None
+      }).toList
+      (rElem, rElemNbrsUpdated.sortBy(_._2).take(numNeighbours), rElemPart, idx)
+    })
+
+    // Combine all the results together
+    val combineR = newRWithLN.map( (v) => (v._4, v)).partitionBy(new spark.HashPartitioner(numPivots))
+
+    combineR.map(_._2).mapPartitions( (v) => {
+      var vecMap:mutable.Map[Vector, List[(LabeledPoint, Double, Int)]] = mutable.HashMap.empty[Vector, List[(LabeledPoint, Double, Int)]].withDefaultValue(List())
+      v.foreach( elem => {
+        vecMap(elem._1) =  elem._2 ::: vecMap(elem._1)
+        vecMap(elem._1) = vecMap(elem._1).distinct
+        None
+      })
+      vecMap.map( elem => (elem._1, elem._2.sortBy(_._2).take(numNeighbours))).toIterator
+    }
+    ).glom().collect().foreach( (v) => {
+      v.foreach(println)
+  })
 
     pivots
   }
@@ -288,10 +325,7 @@ class KNearestNeighbourModel(override val uid: String,
     new PartitionPruningRDD[Vector](rData, (idx) => idx == partition_idx).collect()
   }
 
-  protected def kmeansPivotSelect(RData: RDD[Vector]) = {
-
-  }
-
+  // Compute pivots
   def computePivots(RData: RDD[Vector], strategy: String = "random"): Array[Vector] = {
 
     println("ERROR: Starting to compute pivots")
@@ -300,7 +334,6 @@ class KNearestNeighbourModel(override val uid: String,
     println("ERROR: Data is Partitioned")
     strategy match  {
       case "random" => randomPivotSelect(pRData)
-//      case "greedy" => kmeansPivotSelect(pRData)
     }
 
   }
