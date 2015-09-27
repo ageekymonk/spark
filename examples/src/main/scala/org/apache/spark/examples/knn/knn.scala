@@ -13,6 +13,7 @@ import scala.math._
 object knn {
   def main(args: Array[String]) {
     val conf = new SparkConf().setAppName("Spark Pi")
+    conf.set("spark.mesos.coarse", "true")
     val spark = new SparkContext(conf)
 
     if (args.length < 3) {

@@ -17,19 +17,15 @@
 
 package org.apache.spark.examples
 
-import breeze.linalg.squaredDistance
-import org.apache.log4j.Logger
-import org.apache.spark
-import org.apache.spark.SparkException
-import org.apache.spark.ml.{PredictorParams, PredictionModel, Predictor}
-import org.apache.spark.ml.param.{ParamMap, ParamValidators, Param, DoubleParam}
+import org.apache.spark.ml.{PredictionModel, Predictor}
+import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.util.Identifiable
 import org.apache.spark.mllib.linalg._
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.rdd.{PartitionPruningRDD, RDD}
 import org.apache.spark.sql.DataFrame
 import scala.collection.mutable
-import org.apache.spark.{Partitioner, HashPartitioner}
+import org.apache.spark.Partitioner
 
 class ExactPartitioner[V](partitions: Int)
   extends Partitioner {
@@ -98,74 +94,56 @@ class KNearestNeighbourModel(override val uid: String,
                               )
   extends PredictionModel[Vector, KNearestNeighbourModel] {
 
-  var pivots:Array[Vector] = null
   var featureSummary:List[mutable.Map[String, Any]] = null
   var trainSummary:List[mutable.Map[String, Any]] = null
-  var trainDataLen = 0L
+
+  var trainDataLen = trainData.count()
+  var pivots:Array[Vector] = computePivots(trainData)
+
   var featureDataLen = 0L
+
+  // pTrain is the voronoi partitioned RDD. Number of partition = number of pivots
+  // Each partition is sorted by Distance from pivot
+  // Each element is tuple of (pivot_index, (labeled_point, distance_to_pivot))
+  val pTrain = trainData.map( (lpoint) => (pivots.zipWithIndex.map((v) =>
+    (v._2, (lpoint, Vectors.sqdist(v._1, lpoint.features)))).minBy((v) => v._2._2))
+  ).partitionBy(new ExactPartitioner(numPivots)).mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
+
+  pTrain.cache()
+  generateSummaryTable(pTrain)
 
   override def predict(features: Vector): Double = {
     0.0
   }
 
-  def findNearestPivotIndex(pivots:Array[Vector], fvector: Vector): Int = {
-    pivots.zipWithIndex.map(
-      (v) => (v._2, Vectors.sqdist(v._1, fvector))).minBy((v) => v._2)._1
-  }
+  def generateSummaryTable(pTrain: RDD[(Int, (LabeledPoint, Double))]) = {
 
-  def generateSummaryTable(pFeatures: RDD[(Int, (Vector, Double))], pTrain: RDD[(Int, (LabeledPoint, Double))]) = {
-
-    featureSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
     trainSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
-
-    pFeatures.glom().map( v => (v.maxBy(_._2._2), v.minBy(_._2._2), v.length)).collect().foreach( (elem) =>
-      featureSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2, "count" -> elem._3)
-    )
 
     pTrain.glom().map( v => (v.maxBy(_._2._2), v.minBy(_._2._2), v.take(numNeighbours))).collect().foreach( (elem) =>
       trainSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2, "topn" -> elem._3.toList)
     )
-
-    println(featureSummary)
   }
 
-  def getUpperBound() = {
+  def predict(rData: RDD[Vector]): Array[Vector] = {
 
-  }
+    featureDataLen = rData.count()
 
-  def getLowerBound() = {
-
-  }
-
-  def predict(features: RDD[Vector]): Array[Vector] = {
-
-    trainDataLen = trainData.count()
-    featureDataLen = features.count()
-    pivots = computePivots(features)
-
-    println("Number of pivots calculated = " + pivots.length.toString)
+    println("ERROR: Number of pivots calculated = " + pivots.length.toString)
 
     // pfeatures is the voronoi partitioned RDD. Number of partition = number of pivots
-    // Each partition is sorted by Distance from pivot
+    // Within each partition elements are sorted by Distance from pivot
     // Each element is tuple of (pivot_index, (vector, distance_to_pivot))
-    val pfeatures = features.map( (fvector) =>
-      (pivots.zipWithIndex.map((v) =>
-        (v._2, (fvector, Vectors.sqdist(v._1, fvector)))).minBy((v) => v._2._2))
+//    rData.map( (fvector) =>
+//      (pivots.zipWithIndex.map((v) =>
+//        (v._2, (fvector, Vectors.sqdist(v._1, fvector)))).minBy((v) => v._2._2))
+//    ).partitionBy(new ExactPartitioner(numPivots)).mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
+
+    val pfeatures = rData.map( (fVector) =>
+      (pivots.zipWithIndex.map({
+        case(pVector, idx) => (idx, (fVector, Vectors.sqdist(pVector, fVector)))
+      }).minBy((v) => v._2._2))
     ).partitionBy(new ExactPartitioner(numPivots)).mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
-
-    // pTrain is the voronoi partitioned RDD. Number of partition = number of pivots
-    // Each partition is sorted by Distance from pivot
-    // Each element is tuple of (pivot_index, (labeled_point, distance_to_pivot))
-    val pTrain = trainData.map( (lpoint) => (pivots.zipWithIndex.map((v) =>
-      (v._2, (lpoint, Vectors.sqdist(v._1, lpoint.features)))).minBy((v) => v._2._2))
-    ).partitionBy(new ExactPartitioner(numPivots)).mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
-
-    pTrain.cache()
-
-    generateSummaryTable(pfeatures, pTrain)
-
-    println("ERROR: Number of partitions in pfeatures = " + pfeatures.partitions.size.toString)
-    println("ERROR: Number of partitions in pTrain = " + pTrain.partitions.size.toString)
 
     // Join  => (pivot index ((vector, distance to pivot), (labeled point, distance to pivot) )  )
     // map  => (vector, (labeled point, pivot index))
@@ -181,9 +159,7 @@ class KNearestNeighbourModel(override val uid: String,
       val elemList = v._2._1
       val rElem = v._2._2
       (rElem._1, elemList.map((elem) => (elem._2._1, Vectors.sqdist(elem._2._1.features, rElem._1), elem._1)).sortBy(_._2).take(numNeighbours).toList, v._1)
-    }
-    )
-    println("ERROR: Number of partitions in pFeatureWithLN = " + pFeatureWithLN.partitions.size.toString)
+    })
 
     // pFWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check), feature_vector_partition_id)
     val pFWithLNAndRN = pFeatureWithLN.map( (v) =>
@@ -192,7 +168,7 @@ class KNearestNeighbourModel(override val uid: String,
           if ((p != v._1) && (p != pivots(v._2(0)._3))) {
             val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._2(0)._3))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._2(0)._3))))
             if ((dist >= math.sqrt(v._2.last._2)) ||
-              (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist)) {
+              ((! trainSummary(idx).isEmpty) && (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist))) {
               None
             }
             else {
@@ -213,7 +189,7 @@ class KNearestNeighbourModel(override val uid: String,
 
     var total_repl = pfCount
 
-    while(total_repl > (featureDataLen / numPivots)*10)
+    while(total_repl > (trainDataLen / 10))
     {
       val pFilteredR = pf
       // Move R data to another partition
@@ -245,7 +221,7 @@ class KNearestNeighbourModel(override val uid: String,
             if (p != v._1) {
               val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._4))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._4))))
               if ((dist >= math.sqrt(v._2.last._2)) ||
-                (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist)) {
+                ((! trainSummary(idx).isEmpty) && (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist))) {
                 None
               }
               else {
@@ -323,12 +299,12 @@ class KNearestNeighbourModel(override val uid: String,
   }
 
   // Compute pivots
-  def computePivots(RData: RDD[Vector], strategy: String = "random"): Array[Vector] = {
+  def computePivots(data: RDD[LabeledPoint], strategy: String = "random"): Array[Vector] = {
 
-    val pRData = RData.sample(false, 1.0, 101).zipWithIndex().map( v => (v._2.asInstanceOf[Int], v._1))
-      .partitionBy(new ExactPartitioner((featureDataLen/numPivots).asInstanceOf[Int])).map(_._2)
+    val pData = data.sample(false, 1.0, 101).zipWithIndex().map( v => (v._2.asInstanceOf[Int], v._1))
+      .partitionBy(new ExactPartitioner((trainDataLen/(numPivots)).asInstanceOf[Int])).map(_._2.features)
     strategy match  {
-      case "random" => randomPivotSelect(pRData)
+      case "random" => randomPivotSelect(pData)
     }
 
   }
