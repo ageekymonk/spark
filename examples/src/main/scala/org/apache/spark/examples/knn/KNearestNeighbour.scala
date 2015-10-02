@@ -110,7 +110,7 @@ class KNearestNeighbourModel(override val uid: String,
    */
   val pTrain = trainData.map( (lpoint) =>
      pivots.zipWithIndex.map((v) =>
-      (v._2, (lpoint, Vectors.sqdist(v._1, lpoint.features)))).minBy((v) => v._2._2)
+      (v._2, (lpoint, math.sqrt(Vectors.sqdist(v._1, lpoint.features))))).minBy((v) => v._2._2)
    )
    .partitionBy(new ExactPartitioner(numPivots))
    .mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2 ).toIterator )
@@ -147,7 +147,9 @@ class KNearestNeighbourModel(override val uid: String,
     )
   }
 
-  def predict(rData: RDD[Vector]): Array[Vector] = {
+  def predict(rData: RDD[Vector]): List[(Vector, List[(LabeledPoint, Double)])] = {
+
+    var result:List[(Vector, List[(LabeledPoint, Double)])] = List.empty
 
     featureDataLen = rData.count()
 
@@ -158,7 +160,7 @@ class KNearestNeighbourModel(override val uid: String,
      */
     val pfeatures = rData.map( (fVector) =>
       pivots.zipWithIndex.map({
-        case(pVector, idx) => (idx, (fVector, Vectors.sqdist(pVector, fVector)))
+        case(pVector, idx) => (idx, (fVector, math.sqrt(Vectors.sqdist(pVector, fVector))))
       }).minBy((v) => v._2._2)
     )
      .partitionBy(new ExactPartitioner(numPivots))
@@ -177,7 +179,7 @@ class KNearestNeighbourModel(override val uid: String,
     ).join(pfeatures).map( (v) => {
       val elemList = v._2._1
       val rElem = v._2._2
-      (rElem._1, elemList.map((elem) => (elem._2._1, Vectors.sqdist(elem._2._1.features, rElem._1), elem._1)).sortBy(_._2).take(numNeighbours).toList, v._1)
+      (rElem._1, elemList.map((elem) => (elem._2._1, math.sqrt(Vectors.sqdist(elem._2._1.features, rElem._1)), elem._1)).sortBy(_._2).take(numNeighbours).toList, v._1)
     })
 
     val xyz =  mapTrain.join(pfeatures).map(v => {
@@ -217,12 +219,12 @@ class KNearestNeighbourModel(override val uid: String,
         case (p, idx) =>
           if ((p != v._1) && (v._2.length > 0) && (p != pivots(v._2(0)._3))) {
             val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._2(0)._3))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._2(0)._3))))
-            if ((dist >= math.sqrt(v._2.last._2)) ||
+            if ((dist >= v._2.last._2) ||
               ((! trainSummary(idx).isEmpty) && (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist))) {
               List()
             }
             else {
-              List((math.sqrt(v._2.last._2) - dist, idx))
+              List((v._2.last._2 - dist, idx))
             }
           }
           else {
@@ -239,13 +241,13 @@ class KNearestNeighbourModel(override val uid: String,
     })
 
     pFWithLNAndRN.cache()
+    result = pFWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
 
-    println("ERROR: KNN Found within same partition = " + pFWithLNAndRN.filter((v) => v._3.length == 0).count())
+    println("ERROR: KNN Found within same partition = " + result.size)
 
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
-    var pfCount = pf.count()
 
-    var total_repl = pfCount
+    var total_repl = pf.count()
 
     while(total_repl > (trainDataLen / 10))
     {
@@ -262,7 +264,7 @@ class KNearestNeighbourModel(override val uid: String,
         val elemList = v._2._1
         val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
         val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
-          val dist = Vectors.sqdist(elem._2._1.features, rElem)
+          val dist = math.sqrt(Vectors.sqdist(elem._2._1.features, rElem))
           if (dist < rElemNbrs.last._2)
             List((elem._2._1, dist, elem._1))
           else
@@ -278,12 +280,12 @@ class KNearestNeighbourModel(override val uid: String,
             val p = pivots(idx)
             if (p != v._1) {
               val dist = (Vectors.sqdist(p, v._1) - Vectors.sqdist(v._1, pivots(v._4))) / (2 * math.sqrt(Vectors.sqdist(p, pivots(v._4))))
-              if ((dist >= math.sqrt(v._2.last._2)) ||
+              if ((dist >= v._2.last._2) ||
                 ((! trainSummary(idx).isEmpty) && (math.sqrt(Vectors.sqdist(p, v._1)) - trainSummary(idx)("max_distance").asInstanceOf[Double] > dist))) {
                 None
               }
               else {
-                List((math.sqrt(v._2.last._2) - dist, idx))
+                List((v._2.last._2 - dist, idx))
               }
             }
             else {
@@ -292,9 +294,11 @@ class KNearestNeighbourModel(override val uid: String,
         }).sortBy(_._1).reverse.map(_._2), v._4)
       )
 
+      newRWithLNAndRN.cache()
+
+      result = result ::: newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
-      pfCount = pf.count()
-      println("ERROR: KNN Yet to be searched for = " + pfCount)
+      println("ERROR: KNN Completed for = " + result.size)
       total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
       println("Total elems when replicated = " + total_repl.toString )
     }
@@ -314,7 +318,7 @@ class KNearestNeighbourModel(override val uid: String,
       val elemList = v._2._1
       val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
       val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
-        val dist = Vectors.sqdist(elem._2._1.features, rElem)
+        val dist = math.sqrt(Vectors.sqdist(elem._2._1.features, rElem))
         if (dist < rElemNbrs.last._2)
           List((elem._2._1, dist, elem._1))
         else
@@ -326,7 +330,7 @@ class KNearestNeighbourModel(override val uid: String,
     // Combine all the results together
     val combineR = newRWithLN.map( (v) => (v._4, v)).partitionBy(new ExactPartitioner(numPivots))
 
-    combineR.map(_._2).mapPartitions( (v) => {
+    val combineRFinal = combineR.map(_._2).mapPartitions( (v) => {
       val vecMap:mutable.Map[Vector, List[(LabeledPoint, Double, Int)]] = mutable.HashMap.empty[Vector, List[(LabeledPoint, Double, Int)]].withDefaultValue(List())
       v.foreach( elem => {
         vecMap(elem._1) =  elem._2 ::: vecMap(elem._1)
@@ -335,11 +339,11 @@ class KNearestNeighbourModel(override val uid: String,
       })
       vecMap.map( elem => (elem._1, elem._2.sortBy(_._2).take(numNeighbours))).toIterator
     }
-    ).glom().collect().foreach( (v) => {
-      v.foreach(println)
-  })
+    )
 
-    pivots
+    result = result ::: combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
+
+    result
   }
 
   // Select pivots from a random sample groups based on max distance between each other
