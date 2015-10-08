@@ -175,8 +175,6 @@ class KNNJoin1(object):
                     lb_r.append(s_dict[i]['max_distance']+1)
 
             lb.append(lb_r)
-            print(lb)
-            exit(0)
         return lb
 
     def compute_knn(self, r_part, s_part):

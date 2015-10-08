@@ -24,14 +24,21 @@ object knn {
 
     val (dataFileName, numNeighbours, numPivots) = (args(0), args(1).toInt, args(2).toInt)
 
+//    val parsedData = spark.textFile(dataFileName).map { line =>
+//      val parts = line.split(',').map(_.toDouble)
+//      LabeledPoint(parts(54), Vectors.dense(parts.slice(0, 54)))
+//    }
+
     val parsedData = spark.textFile(dataFileName).map { line =>
       val parts = line.split(',').map(_.toDouble)
-      LabeledPoint(parts(54), Vectors.dense(parts.slice(0, 54)))
+      LabeledPoint(parts(0), Vectors.dense(parts.slice(1, 28)))
     }
-
     val knnModel = new KNearestNeighbourModel("knn", "euclidean", parsedData, numNeighbours, numPivots)
     val fvectors = parsedData.map(_.features)
-    println(knnModel.predict(fvectors))
+    knnModel.predict(fvectors)
+//      .foreach(v => {
+//      println(v._1.toString +"," + v._2.map(x => x._2).toString)
+//    })
     spark.stop()
   }
 }
