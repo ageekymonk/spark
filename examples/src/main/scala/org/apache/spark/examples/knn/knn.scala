@@ -16,13 +16,13 @@ object knn {
     conf.set("spark.mesos.coarse", "true")
     val spark = new SparkContext(conf)
 
-    if (args.length < 3) {
-      println("Missing Arguments. Usage knn dataFileName numNeighbours numPivots")
+    if (args.length < 5) {
+      println("Missing Arguments. Usage knn dataFileName numNeighbours numPivots numDimensions")
       spark.stop()
       sys.exit()
     }
 
-    val (dataFileName, numNeighbours, numPivots) = (args(0), args(1).toInt, args(2).toInt)
+    val (dataFileName, numNeighbours, numPivots, numDimensions, outfile) = (args(0), args(1).toInt, args(2).toInt, args(3).toInt, args(4))
 
 //    val parsedData = spark.textFile(dataFileName).map { line =>
 //      val parts = line.split(',').map(_.toDouble)
@@ -30,12 +30,12 @@ object knn {
 //    }
 
     val parsedData = spark.textFile(dataFileName).map { line =>
-      val parts = line.split(',').map(_.toDouble)
-      LabeledPoint(parts(0), Vectors.dense(parts.slice(1, 28)))
+      val parts = line.split(',').map(_.toDouble.abs)
+      LabeledPoint(parts(0), Vectors.dense(parts.slice(1, 1 + numDimensions)))
     }
     val knnModel = new KNearestNeighbourModel("knn", "euclidean", parsedData, numNeighbours, numPivots)
     val fvectors = parsedData.map(_.features)
-    knnModel.predict(fvectors)
+    knnModel.predict(fvectors, outfile)
 //      .foreach(v => {
 //      println(v._1.toString +"," + v._2.map(x => x._2).toString)
 //    })

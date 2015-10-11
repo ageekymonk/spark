@@ -27,6 +27,7 @@ import org.apache.spark.sql.DataFrame
 import scala.collection.immutable.TreeMap
 import scala.collection.mutable
 import org.apache.spark.Partitioner
+import org.apache.spark.SparkContext
 
 class ExactPartitioner[V](partitions: Int)
   extends Partitioner {
@@ -99,7 +100,7 @@ class KNearestNeighbourModel(override val uid: String,
   var trainSummary:List[mutable.Map[String, Any]] = null
 
   var trainDataLen = trainData.count()
-  var pivots:Array[Vector] = computePivots(trainData).distinct
+  var pivots:Array[Vector] = computePivots(trainData)
   numPivots = pivots.length
   var delta = 50
   var featureDataLen = 0L
@@ -159,9 +160,7 @@ class KNearestNeighbourModel(override val uid: String,
 
   }
 
-  def predict(rData: RDD[Vector]): List[(Vector, List[(LabeledPoint, Double)])] = {
-
-    var result:List[(Vector, List[(LabeledPoint, Double)])] = List.empty
+  def predict(rData: RDD[Vector], pathName: String) = {
 
     featureDataLen = rData.count()
 
@@ -176,7 +175,8 @@ class KNearestNeighbourModel(override val uid: String,
       }).minBy((v) => v._2._2)
     )
      .partitionBy(new ExactPartitioner(numPivots))
-     .mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
+     .mapPartitions( (iter) => iter.toList.toIterator)
+//       .mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2).toIterator)
 
     // Join  => (pivot index ((vector, distance to pivot), (labeled point, distance to pivot) )  )
     // map  => (vector, (labeled point, pivot index))
@@ -249,15 +249,24 @@ class KNearestNeighbourModel(override val uid: String,
       else
       {
         (v._1, v._2, part_list.sortBy(_._1).reverse.map(_._2).toList, v._3)
+//        (v._1, v._2, part_list.sortBy(_._2).reverse.map(_._2).toList, v._3)
       }
     })
 
     pFWithLNAndRN.cache()
-    result = pFWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
-
-    println("ERROR: KNN Found within same partition = " + result.size)
+    var result = pFWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))
+    result.cache()
+    try
+    {
+      println("ERROR: Number of completed elements = " + pFWithLNAndRN.filter((v)=> v._3.length == 0).count())
+    }
+    catch
+    {
+      case msg:Throwable => println("ERROR: Number of completed elements = 0")
+    }
 
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
+    pf.cache()
 
     var total_repl = pf.count()
 
@@ -268,6 +277,8 @@ class KNearestNeighbourModel(override val uid: String,
       val pFilteredR = pf
       // Move R data to another partition
       val pFilteredRWithPart = pFilteredR.map(v => (v._3.head, (v._1, v._2, v._3.tail, v._4))).partitionBy(new ExactPartitioner(numPivots))
+
+      pf.unpersist()
 
       // newRWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
       val newRWithLN = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
@@ -310,11 +321,16 @@ class KNearestNeighbourModel(override val uid: String,
 
       newRWithLNAndRN.cache()
 
-      result = result ::: newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
+      result = result.union(newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))))
+      result.cache()
+
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
-      println("ERROR: KNN Completed for = " + result.size)
+
+      newRWithLNAndRN.unpersist()
+      pf.cache()
+
       total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
-      println("Total elems when replicated = " + total_repl.toString )
+      println("ERROR: Total elems when replicated = " + total_repl.toString )
     }
 
     val pFilteredR = pf
@@ -355,9 +371,8 @@ class KNearestNeighbourModel(override val uid: String,
     }
     )
 
-    result = result ::: combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).collect().toList
+    result.union(combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))).saveAsTextFile(pathName)
 
-    result
   }
 
   // Select pivots from a random sample groups based on max distance between each other
@@ -377,15 +392,10 @@ class KNearestNeighbourModel(override val uid: String,
   // Compute pivots
   def computePivots(data: RDD[LabeledPoint], strategy: String = "random"): Array[Vector] = {
 
-    val pData = data.sample(false, 0.05, 101)
-                    .zipWithIndex()
-                    .map( v => (v._2.asInstanceOf[Int], v._1))
-                    .partitionBy(new ExactPartitioner((trainDataLen/(numPivots)).asInstanceOf[Int]))
-                    .map(_._2.features)
+    val pData = data.takeSample(false, numPivots)
 
-    strategy match  {
-      case "random" => randomPivotSelect(pData)
-    }
+    return pData.map(_.features)
+
   }
 
   override def copy(extra: ParamMap): KNearestNeighbourModel = {
