@@ -28,6 +28,7 @@ import scala.collection.immutable.TreeMap
 import scala.collection.mutable
 import org.apache.spark.Partitioner
 import org.apache.spark.SparkContext
+import scala.util.Random
 
 class ExactPartitioner[V](partitions: Int)
   extends Partitioner {
@@ -100,6 +101,8 @@ class KNearestNeighbourModel(override val uid: String,
   var trainSummary:List[mutable.Map[String, Any]] = null
 
   var trainDataLen = trainData.count()
+  println("ERROR: Total train data = " + trainDataLen.toString)
+  trainData.cache()
   var pivots:Array[Vector] = computePivots(trainData)
   numPivots = pivots.length
   var delta = 50
@@ -121,21 +124,31 @@ class KNearestNeighbourModel(override val uid: String,
 
   generateSummaryTable(pTrain)
 
-  val mapTrain = pTrain.glom().map((v) => {
-    var treemap = TreeMap.empty[Double, List[LabeledPoint]]
+  val pTrainList = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
+    val elemList = iter.next()
+    List((elemList(0)._1, elemList)).toIterator
+  }
+  )
 
-    v.foreach(elem => {
-      if (treemap.contains(math.sqrt(elem._2._2))) {
-        treemap += (math.sqrt(elem._2._2) -> (treemap(math.sqrt(elem._2._2)) ::: List(elem._2._1)))
-      }
-      else
-      {
-        treemap += (math.sqrt(elem._2._2) -> List(elem._2._1))
-      }
+  pTrainList.cache()
+  pTrain.unpersist()
 
-    })
-    (v(0)._1, treemap)
-  })
+
+//  val mapTrain = pTrain.glom().map((v) => {
+//    var treemap = TreeMap.empty[Double, List[LabeledPoint]]
+//
+//    v.foreach(elem => {
+//      if (treemap.contains(math.sqrt(elem._2._2))) {
+//        treemap += (math.sqrt(elem._2._2) -> (treemap(math.sqrt(elem._2._2)) ::: List(elem._2._1)))
+//      }
+//      else
+//      {
+//        treemap += (math.sqrt(elem._2._2) -> List(elem._2._1))
+//      }
+//
+//    })
+//    (v(0)._1, treemap)
+//  })
 
   override def predict(features: Vector): Double = {
     0.0
@@ -184,46 +197,42 @@ class KNearestNeighbourModel(override val uid: String,
     // map => (vector, (idx, [N Neighbour labeled point, distance ])
 
     // pFeatureWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
-    val pFeatureWithLN = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
-      val elemList = iter.next()
-      List((elemList(0)._1, elemList)).toIterator
-    }
-    ).join(pfeatures).map( (v) => {
+    val pFeatureWithLN = pTrainList.join(pfeatures).map( (v) => {
       val elemList = v._2._1
       val rElem = v._2._2
       (rElem._1, elemList.map((elem) => (elem._2._1, math.sqrt(Vectors.sqdist(elem._2._1.features, rElem._1)), elem._1)).sortBy(_._2).take(numNeighbours).toList, v._1)
     })
 
-    val xyz =  mapTrain.join(pfeatures).map(v => {
-      val elemMap = v._2._1
-      val rElem = v._2._2
-      val distFromPivot = math.sqrt(Vectors.sqdist(rElem._1, pivots(v._1)))
-      var computedNeighbours = List.empty[(LabeledPoint, Double, Int)]
-      var numNeighboursFound = 0
-      var distStartLeft = math.floor(distFromPivot)
-      var distStartRight = math.floor(distFromPivot)
-      var mindist = delta
-
-      while((numNeighboursFound < numNeighbours) && ((distStartRight <= math.sqrt(trainSummary(v._1).getOrElse("max_distance", 0).asInstanceOf[Double])) || (distStartLeft >= 0.0))) {
-
-        if (distStartLeft >= 0.0){
-          val leftData = elemMap.range(distStartLeft-delta, distStartLeft)
-          computedNeighbours = computedNeighbours ::: leftData.flatMap(elem =>  elem._2.map(p => (p, Vectors.sqdist(p.features, rElem._1), v._1))).toList
-        }
-
-        val rightData = elemMap.range(distStartRight, distStartRight+delta)
-        computedNeighbours = computedNeighbours ::: rightData.flatMap(elem =>  elem._2.map(p => (p, Vectors.sqdist(p.features, rElem._1), v._1))).toList
-
-        numNeighboursFound = computedNeighbours.count(elem => elem._2 <= mindist)
-
-        distStartLeft = distStartLeft - delta
-        distStartRight = distStartRight + delta
-        mindist = mindist + delta
-      }
-
-      (rElem._1, computedNeighbours.sortBy(_._2).distinct.take(numNeighbours), v._1)
-
-    })
+//    val xyz =  mapTrain.join(pfeatures).map(v => {
+//      val elemMap = v._2._1
+//      val rElem = v._2._2
+//      val distFromPivot = math.sqrt(Vectors.sqdist(rElem._1, pivots(v._1)))
+//      var computedNeighbours = List.empty[(LabeledPoint, Double, Int)]
+//      var numNeighboursFound = 0
+//      var distStartLeft = math.floor(distFromPivot)
+//      var distStartRight = math.floor(distFromPivot)
+//      var mindist = delta
+//
+//      while((numNeighboursFound < numNeighbours) && ((distStartRight <= math.sqrt(trainSummary(v._1).getOrElse("max_distance", 0).asInstanceOf[Double])) || (distStartLeft >= 0.0))) {
+//
+//        if (distStartLeft >= 0.0){
+//          val leftData = elemMap.range(distStartLeft-delta, distStartLeft)
+//          computedNeighbours = computedNeighbours ::: leftData.flatMap(elem =>  elem._2.map(p => (p, Vectors.sqdist(p.features, rElem._1), v._1))).toList
+//        }
+//
+//        val rightData = elemMap.range(distStartRight, distStartRight+delta)
+//        computedNeighbours = computedNeighbours ::: rightData.flatMap(elem =>  elem._2.map(p => (p, Vectors.sqdist(p.features, rElem._1), v._1))).toList
+//
+//        numNeighboursFound = computedNeighbours.count(elem => elem._2 <= mindist)
+//
+//        distStartLeft = distStartLeft - delta
+//        distStartRight = distStartRight + delta
+//        mindist = mindist + delta
+//      }
+//
+//      (rElem._1, computedNeighbours.sortBy(_._2).distinct.take(numNeighbours), v._1)
+//
+//    })
 
     // pFWithLNAndRN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), List(partition_id_to_check), feature_vector_partition_id)
     val pFWithLNAndRN = pFeatureWithLN.map( (v) => {
@@ -254,11 +263,14 @@ class KNearestNeighbourModel(override val uid: String,
     })
 
     pFWithLNAndRN.cache()
+    pFWithLNAndRN.count()
+
     var result = pFWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))
     result.cache()
+
     try
     {
-      println("ERROR: Number of completed elements = " + pFWithLNAndRN.filter((v)=> v._3.length == 0).count())
+      println("ERROR: Number of completed elements = " + result.count())
     }
     catch
     {
@@ -266,26 +278,22 @@ class KNearestNeighbourModel(override val uid: String,
     }
 
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
-    pf.cache()
 
-    var total_repl = pf.count()
+    pf.cache()
+    pf.count()
+
+    var total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
 
     pFWithLNAndRN.unpersist()
 
-    while(total_repl > (trainDataLen / 10))
+    while(total_repl > trainDataLen)
     {
       val pFilteredR = pf
       // Move R data to another partition
       val pFilteredRWithPart = pFilteredR.map(v => (v._3.head, (v._1, v._2, v._3.tail, v._4))).partitionBy(new ExactPartitioner(numPivots))
 
-      pf.unpersist()
-
       // newRWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
-      val newRWithLN = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
-        val elemList = iter.next()
-        List((elemList(0)._1, elemList)).toIterator
-      }
-      ).join(pFilteredRWithPart).map( (v) => {
+      val newRWithLN = pTrainList.join(pFilteredRWithPart).map( (v) => {
         val elemList = v._2._1
         val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
         val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
@@ -320,17 +328,25 @@ class KNearestNeighbourModel(override val uid: String,
       )
 
       newRWithLNAndRN.cache()
+      newRWithLNAndRN.count()
+      pf.unpersist()
+
+      var prev_result = result
 
       result = result.union(newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))))
       result.cache()
+      println("ERROR: Total number of computed elements  =" + result.count())
+
+      prev_result.unpersist()
 
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
-
-      newRWithLNAndRN.unpersist()
       pf.cache()
+      println("ERROR: Total number of Remaining elements  =" + pf.count())
+      newRWithLNAndRN.unpersist()
 
       total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
       println("ERROR: Total elems when replicated = " + total_repl.toString )
+
     }
 
     val pFilteredR = pf
@@ -340,11 +356,7 @@ class KNearestNeighbourModel(override val uid: String,
     ).partitionBy(new ExactPartitioner(numPivots))
 
     // newRWithLN is a tuple of (feature_vector, Array(Labeled_Point, distance_to_feature_vec, partition_id), feature_vector_partition_id)
-    val newRWithLN = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
-      val elemList = iter.next()
-      List((elemList(0)._1, elemList)).toIterator
-    }
-    ).join(pReplicatedRWithPart).map( (v) => {
+    val newRWithLN = pTrainList.join(pReplicatedRWithPart).map( (v) => {
       val elemList = v._2._1
       val (rElem, rElemNbrs, rElemPart, idx) = v._2._2
       val rElemNbrsUpdated = rElemNbrs :::  elemList.flatMap((elem) => {
@@ -358,7 +370,7 @@ class KNearestNeighbourModel(override val uid: String,
     })
 
     // Combine all the results together
-    val combineR = newRWithLN.map( (v) => (v._4, v)).partitionBy(new ExactPartitioner(numPivots))
+    val combineR = newRWithLN.map( (v) => (v._4, v)).partitionBy(new ExactPartitioner(numPivots)).cache()
 
     val combineRFinal = combineR.map(_._2).mapPartitions( (v) => {
       val vecMap:mutable.Map[Vector, List[(LabeledPoint, Double, Int)]] = mutable.HashMap.empty[Vector, List[(LabeledPoint, Double, Int)]].withDefaultValue(List())
@@ -369,14 +381,20 @@ class KNearestNeighbourModel(override val uid: String,
       })
       vecMap.map( elem => (elem._1, elem._2.sortBy(_._2).take(numNeighbours))).toIterator
     }
-    )
+    ).cache()
+
+    println("ERROR: Total count final is " + combineRFinal.count())
 
     result.union(combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))).saveAsTextFile(pathName)
 
   }
 
   // Select pivots from a random sample groups based on max distance between each other
-  protected def randomPivotSelect(rData: RDD[Vector]) = {
+  protected def randomPivotSelect(rData: RDD[Vector]):Array[Vector] = {
+
+    var total_dist = Double.MaxValue
+    var computed_pivots = Array.empty[Vector]
+
 
     val pivot_distance = rData.mapPartitionsWithIndex { (idx, iter) =>
       val total_dist = iter.toSeq.combinations(2).foldLeft(0.0) { (dist, vecs) =>
@@ -392,10 +410,10 @@ class KNearestNeighbourModel(override val uid: String,
   // Compute pivots
   def computePivots(data: RDD[LabeledPoint], strategy: String = "random"): Array[Vector] = {
 
-    val pData = data.takeSample(false, numPivots)
 
-    return pData.map(_.features)
-
+    val pData = data.takeSample(false, numPivots).map(_.features)
+    return pData
+//    return randomPivotSelect(data.context.parallelize(pData, 100))
   }
 
   override def copy(extra: ParamMap): KNearestNeighbourModel = {

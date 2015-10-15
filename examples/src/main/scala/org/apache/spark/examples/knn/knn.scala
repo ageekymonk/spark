@@ -23,7 +23,7 @@ object knn {
     }
 
     val (dataFileName, numNeighbours, numPivots, numDimensions, outfile) = (args(0), args(1).toInt, args(2).toInt, args(3).toInt, args(4))
-
+    println(f"Calculating for $dataFileName%s(D=$numDimensions%d) with k=$numNeighbours%d Pivots=$numPivots%d")
 //    val parsedData = spark.textFile(dataFileName).map { line =>
 //      val parts = line.split(',').map(_.toDouble)
 //      LabeledPoint(parts(54), Vectors.dense(parts.slice(0, 54)))
