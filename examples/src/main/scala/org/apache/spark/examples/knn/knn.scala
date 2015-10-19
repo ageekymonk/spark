@@ -16,13 +16,13 @@ object knn {
     conf.set("spark.mesos.coarse", "true")
     val spark = new SparkContext(conf)
 
-    if (args.length < 5) {
-      println("Missing Arguments. Usage knn dataFileName numNeighbours numPivots numDimensions")
+    if (args.length < 6) {
+      println("Missing Arguments. Usage knn dataFileName numNeighbours numPivots numDimensions bruteforce")
       spark.stop()
       sys.exit()
     }
 
-    val (dataFileName, numNeighbours, numPivots, numDimensions, outfile) = (args(0), args(1).toInt, args(2).toInt, args(3).toInt, args(4))
+    val (dataFileName, numNeighbours, numPivots, numDimensions, outfile, brute) = (args(0), args(1).toInt, args(2).toInt, args(3).toInt, args(4), args(5))
     println(f"Calculating for $dataFileName%s(D=$numDimensions%d) with k=$numNeighbours%d Pivots=$numPivots%d")
 //    val parsedData = spark.textFile(dataFileName).map { line =>
 //      val parts = line.split(',').map(_.toDouble)
@@ -34,8 +34,17 @@ object knn {
       LabeledPoint(parts(0), Vectors.dense(parts.slice(1, 1 + numDimensions)))
     }
     val knnModel = new KNearestNeighbourModel("knn", "euclidean", parsedData, numNeighbours, numPivots)
+
     val fvectors = parsedData.map(_.features)
-    knnModel.predict(fvectors, outfile)
+    if (brute=="bruteforce")
+    {
+      knnModel.bruteForcePredict(fvectors, outfile)
+    }
+    else
+    {
+      knnModel.predict(fvectors, outfile)
+    }
+
 //      .foreach(v => {
 //      println(v._1.toString +"," + v._2.map(x => x._2).toString)
 //    })

@@ -93,45 +93,65 @@ class KNearestNeighbourModel(override val uid: String,
                               val distMetric: String,
                               val trainData: RDD[LabeledPoint],
                               val numNeighbours: Int = 3,
-                              var numPivots: Int = 3
+                              var numPivots: Int = 3,
+                              var method:String = "optimized"
                               )
   extends PredictionModel[Vector, KNearestNeighbourModel] {
 
   var featureSummary:List[mutable.Map[String, Any]] = null
   var trainSummary:List[mutable.Map[String, Any]] = null
 
-  var trainDataLen = trainData.count()
-  println("ERROR: Total train data = " + trainDataLen.toString)
-  trainData.cache()
-  var pivots:Array[Vector] = computePivots(trainData)
-  numPivots = pivots.length
+  var trainDataLen = 0L
+  var pivots:Array[Vector] = Array.empty[Vector]
   var delta = 50
   var featureDataLen = 0L
+  var pTrainList:RDD[(Int, Array[(Int, (LabeledPoint, Double))])] = null
 
-   /*
-   pTrain is the voronoi partitioned RDD. Number of partition = number of pivots
-   Each partition is sorted by Distance from pivot
-   Each element is tuple of (pivot_index, (labeled_point, distance_to_pivot))
-   */
-  val pTrain = trainData.map( (lpoint) =>
-     pivots.zipWithIndex.map((v) =>
-      (v._2, (lpoint, math.sqrt(Vectors.sqdist(v._1, lpoint.features))))).minBy((v) => v._2._2)
-   )
-   .partitionBy(new ExactPartitioner(numPivots))
-   .mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2 ).toIterator )
+  if (method == "optimized")
+  {
+    trainDataLen = trainData.count()
+    trainData.cache()
 
-  pTrain.cache()
 
-  generateSummaryTable(pTrain)
+    println("ERROR: Total train data = " + trainDataLen.toString)
 
-  val pTrainList = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
-    val elemList = iter.next()
-    List((elemList(0)._1, elemList)).toIterator
+    pivots = computePivots(trainData)
+    numPivots = pivots.length
+
+    /*
+    pTrain is the voronoi partitioned RDD. Number of partition = number of pivots
+    Each partition is sorted by Distance from pivot
+    Each element is tuple of (pivot_index, (labeled_point, distance_to_pivot))
+    */
+    val pTrain = trainData.map( (lpoint) =>
+      pivots.zipWithIndex.map((v) =>
+        (v._2, (lpoint, math.sqrt(Vectors.sqdist(v._1, lpoint.features))))).minBy((v) => v._2._2)
+    )
+      .partitionBy(new ExactPartitioner(numPivots))
+      .mapPartitions( (iter) => iter.toList.sortBy( f => f._2._2 ).toIterator )
+
+    pTrain.cache()
+    pTrain.first()
+
+    generateSummaryTable(pTrain)
+
+    pTrainList = pTrain.glom().filter(f => f.length > 0).mapPartitionsWithIndex( (idx, iter) => {
+      val elemList = iter.next()
+      List((elemList(0)._1, elemList)).toIterator
+    })
+
+    pTrainList.cache()
+    pTrainList.first()
+
   }
-  )
+  else
+  {
+    trainData.cache()
+    trainData.repartition(numPivots)
+    trainDataLen = trainData.count()
+  }
 
-  pTrainList.cache()
-  pTrain.unpersist()
+
 
 
 //  val mapTrain = pTrain.glom().map((v) => {
@@ -157,19 +177,52 @@ class KNearestNeighbourModel(override val uid: String,
   def generateSummaryTable(pTrain: RDD[(Int, (LabeledPoint, Double))]) = {
 
     trainSummary = List.fill(pivots.length)(mutable.Map[String, Any]())
+//
+//    pTrain.glom().flatMap( v => {
+//      if (v.isEmpty)
+//      {
+//        None
+//      }
+//      else
+//      Some((v.maxBy(_._2._2), v.minBy(_._2._2)))
+//    }
+//    )
+//      .collect().foreach( (elem) =>
+//      trainSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2)
+//    )
 
-    pTrain.glom().flatMap( v => {
-      if (v.isEmpty)
-      {
-        None
+        val temp = pTrain.mapPartitions( viter => {
+          val v = viter.toArray
+          Some((v.maxBy(_._2._2), v.minBy(_._2._2))).toIterator
+        }
+        )
+
+          temp.cache()
+          temp.first()
+          temp.collect().foreach( (elem) =>
+          trainSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2)
+        )
+
+  }
+
+  def bruteForcePredict(rData:RDD[Vector], pathName:String) = {
+
+    val curRData = rData.repartition(numPivots)
+    curRData.cache()
+    val trainDataList = trainData.glom()
+    trainDataList.cache()
+    trainDataList.first()
+    curRData.first()
+    val output = trainDataList.cartesian(curRData).flatMap({
+      case (lpoint, rpoint) => {
+        lpoint.flatMap(v =>Some(rpoint, v, math.sqrt(Vectors.sqdist(rpoint, v.features))) )
+          .sortBy(_._3).take(numNeighbours).groupBy(_._1)
+          .map(v => (v._1, v._2.map(elem => (elem._2, elem._3))))
       }
-      else
-      Some((v.maxBy(_._2._2), v.minBy(_._2._2)))
-    }
-    )
-      .collect().foreach( (elem) =>
-      trainSummary(elem._1._1) += ("max_distance" -> elem._1._2._2, "min_distance" -> elem._2._2._2)
-    )
+    }).groupBy(_._1).map(v => (v._1, v._2.flatMap(elem => elem._2).toArray.sortBy(_._2).take(numNeighbours)))
+
+    println("Total output = " + output.count())
+//    curRData.cartesian(trainData).map(v => (v._1, v._2, math.sqrt(Vectors.sqdist(v._1, v._2.features)))).groupBy(_._1).map(v => (v._1, v._2.toList.sortBy(_._3).take(numNeighbours))).saveAsTextFile(pathName)
 
   }
 
@@ -263,14 +316,14 @@ class KNearestNeighbourModel(override val uid: String,
     })
 
     pFWithLNAndRN.cache()
-    pFWithLNAndRN.count()
+    pFWithLNAndRN.first()
 
     var result = pFWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))
-    result.cache()
 
     try
     {
-      println("ERROR: Number of completed elements = " + result.count())
+//      println("ERROR: Number of completed elements = " + result.count())
+      result.first()
     }
     catch
     {
@@ -280,7 +333,7 @@ class KNearestNeighbourModel(override val uid: String,
     var pf = pFWithLNAndRN.filter(v => v._3.length > 0)
 
     pf.cache()
-    pf.count()
+    pf.first()
 
     var total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
 
@@ -328,20 +381,22 @@ class KNearestNeighbourModel(override val uid: String,
       )
 
       newRWithLNAndRN.cache()
-      newRWithLNAndRN.count()
+      newRWithLNAndRN.first()
       pf.unpersist()
 
-      var prev_result = result
+//      var prev_result = result
 
-      result = result.union(newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))))
-      result.cache()
-      println("ERROR: Total number of computed elements  =" + result.count())
+//      result = result.union(newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))))
 
-      prev_result.unpersist()
+      newRWithLNAndRN.filter((v)=> v._3.length == 0).map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2))))).first()
+//      println("ERROR: Total number of computed elements  =" )
+
+//      prev_result.unpersist()
 
       pf = newRWithLNAndRN.filter(v => v._3.length > 0)
       pf.cache()
-      println("ERROR: Total number of Remaining elements  =" + pf.count())
+//      println("ERROR: Total number of Remaining elements  =" + pf.count())
+      pf.first()
       newRWithLNAndRN.unpersist()
 
       total_repl = pf.map((v) => v._3.size).reduce((tot, add) => tot + add)
@@ -383,9 +438,10 @@ class KNearestNeighbourModel(override val uid: String,
     }
     ).cache()
 
-    println("ERROR: Total count final is " + combineRFinal.count())
+//    println("ERROR: Total count final is " + combineRFinal.count())
+    combineRFinal.first()
 
-    result.union(combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))).saveAsTextFile(pathName)
+//    result.union(combineRFinal.map(v => (v._1, v._2.flatMap(e => Some((e._1, e._2)))))).saveAsTextFile(pathName)
 
   }
 
